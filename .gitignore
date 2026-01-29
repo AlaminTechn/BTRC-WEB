@@ -1,0 +1,17 @@
+/DEV-V2/
+/dummy_data_v/
+/outputs/
+/logs/
+/checkpoints/
+/.ipynb_checkpoints/
+/.vscode/
+/.idea/
+/.DS_Store
+/*.pyc
+/__pycache__/
+/data/raw/
+/superset-venv/
+.env
+.envrc
+*.log
+DEV-V2-V2
