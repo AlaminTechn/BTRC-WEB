@@ -1,0 +1,805 @@
+================================================================================
+           BTRC QoS MONITORING DASHBOARD - DATA FLOW GUIDE (DEV-V2)
+================================================================================
+
+TABLE OF CONTENTS
+-----------------
+1. High-Level Data Flow Overview
+2. Database Schema (PostgreSQL 15 + TimescaleDB)
+3. Data Sources & Collection
+4. Dashboard → Tab → Chart → Column Mapping
+5. Data Transformations
+6. Mock Data Structure
+7. Key File Locations
+
+================================================================================
+1. HIGH-LEVEL DATA FLOW OVERVIEW
+================================================================================
+
+      ┌──────────────────────────────────────────────────────────────────────┐
+      │                         DATABASE LAYER                                │
+      │                   PostgreSQL 15 + TimescaleDB                         │
+      │  ┌────────────────────────────────────────────────────────────────┐  │
+      │  │ Foundation Tables │ Infrastructure │ Products │ Time-Series   │  │
+      │  │ (geo_divisions,   │ (isps, pops,   │(packages,│(ts_interface, │  │
+      │  │  geo_districts,   │  software_     │ subscriber│ts_qos_       │  │
+      │  │  geo_upazilas)    │  agents)       │ _snapshots)│measurements) │  │
+      │  └────────────────────────────────────────────────────────────────┘  │
+      └──────────────────────────────────────────────────────────────────────┘
+                                       ▲
+                                       │
+                    ┌─────────────────────────────────────────┐
+                    │           DATA SOURCES                   │
+                    │  ┌───────────┐ ┌───────────┐ ┌─────────┐│
+                    │  │SNMP_AGENT │ │QOS_AGENT  │ │ISP_API  ││
+                    │  │(Docker)   │ │(Docker)   │ │(Portal) ││
+                    │  │Trust: 95  │ │Trust: 90  │ │Trust: 70││
+                    │  └─────┬─────┘ └─────┬─────┘ └────┬────┘│
+                    └────────┼─────────────┼────────────┼─────┘
+                             │             │            │
+                             ▼             ▼            ▼
+                    ┌─────────────────────────────────────────┐
+                    │           INGESTION LAYER               │
+                    │  • API Authentication (API Key + TLS)   │
+                    │  • Schema Validation                    │
+                    │  • Deduplication (UUID, 24h window)     │
+                    │  • Transform & Normalize                │
+                    └─────────────────┬───────────────────────┘
+                                      │
+                                      ▼
+                    ┌─────────────────────────────────────────┐
+                    │           STORAGE LAYER                 │
+                    │  ┌─────────────────────────────────┐    │
+                    │  │      TimescaleDB               │    │
+                    │  │  • ts_interface_metrics        │    │
+                    │  │  • ts_qos_measurements         │    │
+                    │  │  • ts_subscriber_counts        │    │
+                    │  └─────────────────────────────────┘    │
+                    │  ┌─────────────────────────────────┐    │
+                    │  │   Continuous Aggregates         │    │
+                    │  │  15-min → 1-hour → 1-day       │    │
+                    │  └─────────────────────────────────┘    │
+                    └─────────────────┬───────────────────────┘
+                                      │
+                                      ▼
+                    ┌─────────────────────────────────────────┐
+                    │           API LAYER                     │
+                    │  • Query Service (REST)                 │
+                    │  • Authentication & Authorization       │
+                    │  • Role-Based Filtering                 │
+                    └─────────────────┬───────────────────────┘
+                                      │
+                                      ▼
+                    ┌─────────────────────────────────────────┐
+                    │           DASHBOARD LAYER               │
+                    │  ┌───────────┐ ┌───────────┐ ┌─────────┐│
+                    │  │EXECUTIVE  │ │TECH-OPS   │ │REGULATORY│
+                    │  │5 Tabs     │ │4 Tabs     │ │5 Tabs   ││
+                    │  │Leadership │ │Platform   │ │Compliance│
+                    │  └───────────┘ └───────────┘ └─────────┘│
+                    └─────────────────────────────────────────┘
+
+
+================================================================================
+2. DATABASE SCHEMA (PostgreSQL 15 + TimescaleDB)
+================================================================================
+
+DATABASE ENGINE: PostgreSQL 15 with TimescaleDB Extension
+SCHEMA FILE: init-scripts/01-schema.sql
+
+┌─────────────────────────────────────────────────────────────────────────────┐
+│ STEP 1: FOUNDATION TABLES (Geographic Reference Data)                       │
+├─────────────────────────────────────────────────────────────────────────────┤
+│                                                                             │
+│ geo_divisions                    geo_districts                              │
+│ ├── id (PK, SERIAL)              ├── id (PK, SERIAL)                        │
+│ ├── bbs_code (CHAR(2), UNIQUE)   ├── division_id (FK → geo_divisions)       │
+│ ├── name_en (VARCHAR)            ├── bbs_code (CHAR(4), UNIQUE)             │
+│ ├── name_bn (VARCHAR)            ├── district_code (CHAR(2))                │
+│ ├── latitude (DECIMAL)           ├── name_en, name_bn (VARCHAR)             │
+│ ├── longitude (DECIMAL)          ├── latitude, longitude (DECIMAL)          │
+│ ├── is_active (BOOLEAN)          └── is_active, created_at, updated_at      │
+│ └── created_at, updated_at                                                  │
+│                                                                             │
+│ geo_upazilas                     isp_license_categories                     │
+│ ├── id (PK, SERIAL)              ├── id (PK, SERIAL)                        │
+│ ├── district_id (FK)             ├── code (VARCHAR(20), UNIQUE)             │
+│ ├── bbs_code (CHAR(6), UNIQUE)   ├── name_en, name_bn (VARCHAR)             │
+│ ├── upazila_code (CHAR(2))       ├── description (TEXT)                     │
+│ ├── name_en, name_bn (VARCHAR)   ├── coverage_scope (VARCHAR)               │
+│ └── latitude, longitude, etc.    └── is_active, created_at, updated_at      │
+│                                                                             │
+│ NOTE: 8 Divisions → 64 Districts → 495 Upazilas (Bangladesh BBS codes)      │
+└─────────────────────────────────────────────────────────────────────────────┘
+
+┌─────────────────────────────────────────────────────────────────────────────┐
+│ STEP 2: INFRASTRUCTURE TABLES (ISPs, PoPs, Agents)                          │
+├─────────────────────────────────────────────────────────────────────────────┤
+│                                                                             │
+│ isps (ISP Master Table)          pops (Points of Presence)                  │
+│ ├── id (PK, SERIAL)              ├── id (PK, SERIAL)                        │
+│ ├── btrc_license_no (UNIQUE)     ├── isp_id (FK → isps)                     │
+│ ├── name_en, name_bn (VARCHAR)   ├── code, name_en (VARCHAR)                │
+│ ├── trade_name (VARCHAR)         ├── category_id (FK → pop_categories)      │
+│ ├── license_category_id (FK)     ├── district_id (FK → geo_districts)       │
+│ ├── license_issue_date (DATE)    ├── address (TEXT)                         │
+│ ├── license_expiry_date (DATE)   ├── latitude, longitude (DECIMAL)          │
+│ ├── license_status (VARCHAR)     ├── upstream_type_id (FK)                  │
+│ ├── headquarters_district_id     ├── upstream_bandwidth_mbps (INTEGER)      │
+│ ├── total_subscribers (INTEGER)  ├── status (VARCHAR)                       │
+│ ├── total_bandwidth_gbps         └── is_active, created_at, updated_at      │
+│ └── api_enabled, is_active                                                  │
+│                                                                             │
+│ software_agents                  pop_categories / upstream_types            │
+│ ├── id (PK, SERIAL)              ├── id (PK, SERIAL)                        │
+│ ├── isp_id (FK → isps)           ├── code (VARCHAR, UNIQUE)                 │
+│ ├── agent_type (VARCHAR)         ├── name_en (VARCHAR)                      │
+│ │   • SNMP_AGENT                 ├── description (TEXT)                     │
+│ │   • QOS_AGENT                  └── is_active, created_at                  │
+│ ├── agent_uuid (VARCHAR)                                                    │
+│ ├── version (VARCHAR)            agent_pop_assignments                      │
+│ ├── host_ip (VARCHAR)            ├── id (PK, SERIAL)                        │
+│ └── status, is_active            ├── agent_id (FK → software_agents)        │
+│                                  ├── pop_id (FK → pops)                     │
+│                                  ├── assignment_date (DATE)                 │
+│                                  └── is_primary, is_active                  │
+└─────────────────────────────────────────────────────────────────────────────┘
+
+┌─────────────────────────────────────────────────────────────────────────────┐
+│ STEP 3: PRODUCT & SUBSCRIBER TABLES                                         │
+├─────────────────────────────────────────────────────────────────────────────┤
+│                                                                             │
+│ packages                         subscriber_snapshots                       │
+│ ├── id (PK, SERIAL)              ├── id (PK, SERIAL)                        │
+│ ├── isp_id (FK → isps)           ├── isp_id (FK → isps)                     │
+│ ├── package_type_id (FK)         ├── snapshot_month (DATE)                  │
+│ ├── connection_type_id (FK)      ├── package_id (FK → packages)             │
+│ ├── code, name_en (VARCHAR)      ├── district_id (FK → geo_districts)       │
+│ ├── download_speed_mbps          ├── total_subscribers (INTEGER)            │
+│ ├── upload_speed_mbps            └── active_subscribers (INTEGER)           │
+│ ├── monthly_price_bdt                                                       │
+│ └── is_active, created_at        package_types / connection_types           │
+│                                  ├── id (PK, SERIAL)                        │
+│                                  ├── code (VARCHAR, UNIQUE)                 │
+│                                  ├── name_en, description                   │
+│                                  └── is_active, created_at                  │
+└─────────────────────────────────────────────────────────────────────────────┘
+
+┌─────────────────────────────────────────────────────────────────────────────┐
+│ STEP 4: QOS & COMPLIANCE TABLES                                             │
+├─────────────────────────────────────────────────────────────────────────────┤
+│                                                                             │
+│ qos_parameters                   qos_test_targets                           │
+│ ├── id (PK, SERIAL)              ├── id (PK, SERIAL)                        │
+│ ├── code (VARCHAR, UNIQUE)       ├── code, name_en (VARCHAR)                │
+│ │   • LATENCY_MS                 ├── target_type (VARCHAR)                  │
+│ │   • JITTER_MS                  │   • NATIONAL / INTERNATIONAL             │
+│ │   • PACKET_LOSS_PCT            ├── host (VARCHAR)                         │
+│ │   • DOWNLOAD_MBPS              ├── port (INTEGER)                         │
+│ │   • UPLOAD_MBPS                ├── is_bdix (BOOLEAN)                      │
+│ │   • AVAILABILITY_PCT           └── expected_latency_ms                    │
+│ ├── name_en, unit                                                           │
+│ └── description, is_active       sla_thresholds                             │
+│                                  ├── id (PK, SERIAL)                        │
+│ sla_violations                   ├── qos_parameter_id (FK)                  │
+│ ├── id (PK, SERIAL)              ├── license_category_id (FK)               │
+│ ├── isp_id, pop_id (FK)          ├── package_type_id (FK)                   │
+│ ├── qos_parameter_id (FK)        ├── threshold_type (VARCHAR)               │
+│ ├── sla_threshold_id (FK)        ├── threshold_value (DECIMAL)              │
+│ ├── violation_type (VARCHAR)     ├── warning_threshold (DECIMAL)            │
+│ ├── severity (WARNING/CRITICAL)  └── effective_date, is_active              │
+│ ├── detection_time (TIMESTAMPTZ)                                            │
+│ ├── expected_value, actual_value                                            │
+│ ├── deviation_pct                                                           │
+│ └── status (OPEN/CLOSED)                                                    │
+└─────────────────────────────────────────────────────────────────────────────┘
+
+┌─────────────────────────────────────────────────────────────────────────────┐
+│ STEP 5: TIME-SERIES TABLES (TimescaleDB Hypertables)                        │
+├─────────────────────────────────────────────────────────────────────────────┤
+│                                                                             │
+│ ts_interface_metrics (HYPERTABLE)     ts_subscriber_counts (HYPERTABLE)     │
+│ ├── time (TIMESTAMPTZ, PK)            ├── time (TIMESTAMPTZ, PK)            │
+│ ├── pop_id (INTEGER)                  ├── pop_id (INTEGER)                  │
+│ ├── upstream_type_id (INTEGER)        ├── agent_id (INTEGER)                │
+│ ├── agent_id (INTEGER)                ├── active_sessions (INTEGER)         │
+│ ├── in_bps (BIGINT)                   ├── pppoe_sessions (INTEGER)          │
+│ ├── out_bps (BIGINT)                  └── dhcp_leases (INTEGER)             │
+│ ├── in_errors, out_errors (BIGINT)                                          │
+│ ├── in_discards, out_discards         ts_qos_measurements (HYPERTABLE)      │
+│ ├── utilization_in_pct (DECIMAL)      ├── time (TIMESTAMPTZ, PK)            │
+│ └── utilization_out_pct (DECIMAL)     ├── pop_id (INTEGER)                  │
+│                                       ├── agent_id (INTEGER)                │
+│ Chunk Interval: 7 days (default)      ├── test_target_id (INTEGER)          │
+│ Compression: After 30 days            ├── test_type (VARCHAR)               │
+│ Retention: See section 4              ├── is_bdix (BOOLEAN)                 │
+│                                       ├── latency_ms (DECIMAL)              │
+│                                       ├── jitter_ms (DECIMAL)               │
+│                                       ├── packet_loss_pct (DECIMAL)         │
+│                                       ├── download_mbps (DECIMAL)           │
+│                                       └── upload_mbps (DECIMAL)             │
+└─────────────────────────────────────────────────────────────────────────────┘
+
+┌─────────────────────────────────────────────────────────────────────────────┐
+│ DATABASE INDEXES                                                            │
+├─────────────────────────────────────────────────────────────────────────────┤
+│                                                                             │
+│ Foreign Key Indexes:                                                        │
+│ • idx_geo_districts_division      ON geo_districts(division_id)             │
+│ • idx_geo_upazilas_district       ON geo_upazilas(district_id)              │
+│ • idx_isps_license_category       ON isps(license_category_id)              │
+│ • idx_isps_district               ON isps(headquarters_district_id)         │
+│ • idx_pops_isp                    ON pops(isp_id)                           │
+│ • idx_pops_district               ON pops(district_id)                      │
+│ • idx_pops_category               ON pops(category_id)                      │
+│ • idx_agents_isp                  ON software_agents(isp_id)                │
+│ • idx_packages_isp                ON packages(isp_id)                       │
+│ • idx_subscriber_snapshots_isp    ON subscriber_snapshots(isp_id)           │
+│ • idx_violations_isp              ON sla_violations(isp_id)                 │
+│                                                                             │
+│ Time-Series Indexes (Compound):                                             │
+│ • idx_ts_interface_pop_time       ON ts_interface_metrics(pop_id, time)     │
+│ • idx_ts_subscriber_isp_time      ON ts_subscriber_counts(isp_id, time)     │
+│ • idx_ts_qos_pop_time             ON ts_qos_measurements(pop_id, time)      │
+└─────────────────────────────────────────────────────────────────────────────┘
+
+TABLE RELATIONSHIPS (Entity Diagram):
+─────────────────────────────────────
+
+geo_divisions (1) ──┬──< geo_districts (N)
+                    └──────────┬──────────< geo_upazilas (N)
+                               │
+isp_license_categories (1) ────┼──< isps (N)
+                               │      │
+                               │      ├──< pops (N) ──┬──< ts_interface_metrics
+                               │      │               ├──< ts_subscriber_counts
+                               │      │               └──< ts_qos_measurements
+                               │      │
+                               │      ├──< software_agents (N) ──< agent_pop_assignments
+                               │      │
+                               │      ├──< packages (N)
+                               │      │
+                               │      ├──< subscriber_snapshots (N)
+                               │      │
+                               │      └──< sla_violations (N)
+                               │
+qos_parameters (1) ────────────┼──< sla_thresholds (N)
+                               │
+qos_test_targets (1) ──────────┴──< ts_qos_measurements (N)
+
+
+================================================================================
+3. DATA SOURCES & COLLECTION
+================================================================================
+
+SNMP_AGENT (Docker Container)
+-----------------------------
+• Frequency: Every 15 minutes (3 polls × 5 min)
+• Trust Level: 95 (highest priority)
+• Collects:
+  - Interface metrics (in_bps, out_bps, utilization %)
+  - Interface status (UP/DOWN/TESTING)
+  - Subscriber counts (BRAS sessions)
+  - Device health (CISCO/HUAWEI/MIKROTIK)
+
+• Endpoint: POST /api/v1/submissions/snmp-combined
+
+
+QOS_AGENT (Docker Container)
+----------------------------
+• Frequency: Every 15 minutes
+• Trust Level: 90
+• Collects:
+  - Speed tests (Download/Upload Mbps)
+  - Latency/Jitter/Packet Loss
+  - DNS resolution time
+  - HTTP reachability
+  - Traceroute
+
+• Endpoint: POST /api/v1/submissions/qos-measurements
+
+
+ISP_API (Portal/CSV Upload)
+---------------------------
+• Frequency: Monthly (by 10th of each month)
+• Trust Level: 70 (lowest priority)
+• Collects:
+  - Package definitions (speeds, prices)
+  - Subscriber counts (by Package × Location)
+  - PoP infrastructure data
+  - Revenue data
+
+• Endpoints:
+  POST /api/v1/isp/{isp_id}/packages
+  POST /api/v1/isp/{isp_id}/subscribers
+  POST /api/v1/isp/{isp_id}/pops
+  POST /api/v1/isp/{isp_id}/revenue
+
+
+================================================================================
+4. DASHBOARD → TAB → CHART → COLUMN MAPPING
+================================================================================
+
+┌─────────────────────────────────────────────────────────────────────────────┐
+│                         EXECUTIVE DASHBOARD                                 │
+│                    (BTRC Leadership/Policy Makers)                          │
+├─────────────────────────────────────────────────────────────────────────────┤
+│ TAB 1: PERFORMANCE SCORECARD                                                │
+│ ├── Chart: National KPI Cards (4)                                           │
+│ │   └── Columns: download_mbps, upload_mbps, availability_pct, equity_index │
+│ │   └── Source: ts_qos_measurements (aggregated)                            │
+│ ├── Chart: Speed Trend (Line Chart - 12 months)                             │
+│ │   └── Columns: time, avg_download_mbps, avg_upload_mbps                   │
+│ │   └── Source: ts_qos_measurements (daily aggregate)                       │
+│ ├── Chart: Division Performance (Bar Chart)                                 │
+│ │   └── Columns: division_name, avg_speed_mbps, rank                        │
+│ │   └── Source: ts_qos_measurements + geographic lookup                     │
+│ └── Chart: ISP Category Breakdown (Table)                                   │
+│     └── Columns: category (Nationwide/Regional/Zonal/District), metrics     │
+│     └── Source: ts_qos_measurements + isp_master                            │
+├─────────────────────────────────────────────────────────────────────────────┤
+│ TAB 2: GEOGRAPHIC INTELLIGENCE                                              │
+│ ├── Chart: Geographic Heatmap (Map)                                         │
+│ │   └── Columns: district_id, bbs_code, avg_speed, availability             │
+│ │   └── Source: ts_qos_measurements + districts                             │
+│ ├── Chart: Division Comparison (Bar Chart)                                  │
+│ │   └── Columns: division_name, speed_mbps, urban_speed, rural_speed        │
+│ │   └── Source: ts_qos_measurements + geographic                            │
+│ └── Chart: Urban/Rural Equity (Line/Bar)                                    │
+│     └── Columns: location_type, avg_speed, gap_pct                          │
+│     └── Source: ts_qos_measurements + pops (location type)                  │
+├─────────────────────────────────────────────────────────────────────────────┤
+│ TAB 3: COMPLIANCE ENFORCEMENT                                               │
+│ ├── Chart: Violation Dashboard (KPI Cards + Table)                          │
+│ │   └── Columns: isp_id, violation_type, severity, timestamp                │
+│ │   └── Source: sla_violations + isp_master                                 │
+│ ├── Chart: ISP Compliance Status (Table)                                    │
+│ │   └── Columns: isp_name, compliance_pct, violations_count                 │
+│ │   └── Source: sla_compliance_scores                                       │
+│ └── Chart: Threshold Breach Timeline (Line Chart)                           │
+│     └── Columns: time, breach_count, severity_level                         │
+│     └── Source: threshold_breaches (time-series)                            │
+├─────────────────────────────────────────────────────────────────────────────┤
+│ TAB 4: CONSUMER EXPERIENCE                                                  │
+│ ├── Chart: Speed Distribution (Histogram)                                   │
+│ │   └── Columns: speed_bucket, subscriber_count, package_code               │
+│ │   └── Source: ts_qos_measurements + packages                              │
+│ ├── Chart: Package Compliance (Table)                                       │
+│ │   └── Columns: package_name, advertised_speed, actual_speed, compliance   │
+│ │   └── Source: ts_qos_measurements + packages                              │
+│ └── Chart: Download/Upload Benchmarks (Bar Chart)                           │
+│     └── Columns: package_tier, avg_download, avg_upload, target             │
+│     └── Source: ts_qos_measurements + packages                              │
+├─────────────────────────────────────────────────────────────────────────────┤
+│ TAB 5: INFRA STATUS                                                         │
+│ ├── Chart: PoP Coverage Map (Geospatial)                                    │
+│ │   └── Columns: pop_id, latitude, longitude, status, capacity              │
+│ │   └── Source: pops + geographic                                           │
+│ ├── Chart: Capacity Utilization (Gauge Charts)                              │
+│ │   └── Columns: pop_id, utilization_in_pct, utilization_out_pct            │
+│ │   └── Source: ts_interface_metrics (latest)                               │
+│ └── Chart: Subscriber Growth (Line Chart)                                   │
+│     └── Columns: month, total_subscribers, net_growth                       │
+│     └── Source: subscriber_snapshots (monthly)                              │
+└─────────────────────────────────────────────────────────────────────────────┘
+
+┌─────────────────────────────────────────────────────────────────────────────┐
+│                         TECH-OPS DASHBOARD                                  │
+│                      (BTRC Technical Team)                                  │
+├─────────────────────────────────────────────────────────────────────────────┤
+│ TAB 1: PLATFORM HEALTH                                                      │
+│ ├── Chart: Kafka/Flink Throughput (Line Chart)                              │
+│ │   └── Columns: time, messages_per_sec, lag                                │
+│ │   └── Source: platform_metrics                                            │
+│ ├── Chart: DB Health (Gauge)                                                │
+│ │   └── Columns: connection_pool_pct, query_latency_ms                      │
+│ │   └── Source: db_health_metrics                                           │
+│ └── Chart: API Response Times (Line Chart)                                  │
+│     └── Columns: time, p50_ms, p95_ms, p99_ms                               │
+│     └── Source: api_metrics                                                 │
+├─────────────────────────────────────────────────────────────────────────────┤
+│ TAB 2: MEASUREMENT NETWORK                                                  │
+│ ├── Chart: Probe Status (KPI Cards)                                         │
+│ │   └── Columns: status (ONLINE/OFFLINE/DEGRADED), count                    │
+│ │   └── Source: agents (where type=QOS_AGENT)                               │
+│ └── Chart: Probe Health (Table)                                             │
+│     └── Columns: agent_id, cpu_pct, memory_pct, last_seen                   │
+│     └── Source: agent_health_metrics                                        │
+├─────────────────────────────────────────────────────────────────────────────┤
+│ TAB 3: NETWORK METRICS                                                      │
+│ ├── Chart: Bandwidth Utilization (Line Chart)                               │
+│ │   └── Columns: time, in_bps, out_bps, capacity                            │
+│ │   └── Source: ts_interface_metrics                                        │
+│ ├── Chart: Latency Trends (Line Chart)                                      │
+│ │   └── Columns: time, latency_ms, jitter_ms                                │
+│ │   └── Source: ts_qos_measurements                                         │
+│ └── Chart: Packet Loss (Line Chart)                                         │
+│     └── Columns: time, packet_loss_pct                                      │
+│     └── Source: ts_qos_measurements                                         │
+├─────────────────────────────────────────────────────────────────────────────┤
+│ TAB 4: INFRASTRUCTURE ANALYTICS                                             │
+│ ├── Chart: PoP Equipment (Table)                                            │
+│ │   └── Columns: pop_id, device_count, vendor, capacity                     │
+│ │   └── Source: snmp_targets + pops                                         │
+│ └── Chart: Capacity Projections (Line Chart)                                │
+│     └── Columns: month, current_usage, projected_3m, projected_6m           │
+│     └── Source: capacity_forecasts (calculated)                             │
+└─────────────────────────────────────────────────────────────────────────────┘
+
+┌─────────────────────────────────────────────────────────────────────────────┐
+│                        REGULATORY DASHBOARD                                 │
+│                     (BTRC Operations Staff)                                 │
+├─────────────────────────────────────────────────────────────────────────────┤
+│ TAB 1: SLA MONITORING                                                       │
+│ ├── Chart: Package vs Measured Speed (Table)                                │
+│ │   └── Columns: package_code, advertised_mbps, measured_mbps, status       │
+│ │   └── Source: packages + ts_qos_measurements                              │
+│ └── Chart: PoP-Level Validation (Heatmap)                                   │
+│     └── Columns: pop_id, sla_compliance_pct, alert_status                   │
+│     └── Source: ts_qos_measurements + pops                                  │
+├─────────────────────────────────────────────────────────────────────────────┤
+│ TAB 2: REGIONAL ANALYSIS                                                    │
+│ ├── Chart: Division Performance (Bar Chart)                                 │
+│ │   └── Columns: division_name, avg_speed, availability_pct                 │
+│ │   └── Source: ts_qos_measurements + divisions                             │
+│ └── Chart: Urban vs Rural (Comparison Chart)                                │
+│     └── Columns: area_type, speed_mbps, gap_pct                             │
+│     └── Source: ts_qos_measurements + pops                                  │
+├─────────────────────────────────────────────────────────────────────────────┤
+│ TAB 3: VIOLATION REPORTING                                                  │
+│ ├── Chart: Violation Queue (Table)                                          │
+│ │   └── Columns: violation_id, isp_name, type, severity, evidence_url       │
+│ │   └── Source: sla_violations + evidence_packages                          │
+│ └── Export: PDF/Excel Reports                                               │
+│     └── Columns: Full violation details with audit trail                    │
+│     └── Source: violation_reports (generated)                               │
+├─────────────────────────────────────────────────────────────────────────────┤
+│ TAB 4: INVESTIGATION                                                        │
+│ ├── Chart: Multi-Source Correlation (Scatter Plot)                          │
+│ │   └── Columns: snmp_speed, qos_speed, isp_reported_speed                  │
+│ │   └── Source: All three data sources                                      │
+│ └── Chart: Root Cause Analysis (Drill-down Table)                           │
+│     └── Columns: metric, value, source, timestamp, anomaly_flag             │
+│     └── Source: ts_* tables with cross-reference                            │
+├─────────────────────────────────────────────────────────────────────────────┤
+│ TAB 5: LICENSE COMPLIANCE                                                   │
+│ ├── Chart: PoP Deployment Status (Table)                                    │
+│ │   └── Columns: isp_id, required_pops, deployed_pops, compliance_pct       │
+│ │   └── Source: license_conditions + pops                                   │
+│ └── Chart: Coverage Targets (Progress Bars)                                 │
+│     └── Columns: target_type, target_value, current_value, pct              │
+│     └── Source: coverage_targets + subscriber_snapshots                     │
+└─────────────────────────────────────────────────────────────────────────────┘
+
+
+================================================================================
+5. DATA TRANSFORMATIONS
+================================================================================
+
+LAYER 1: INGESTION TRANSFORMATIONS
+----------------------------------
+
+SNMP_AGENT Data:
+• Rate Calculation:
+  in_bps = (in_bytes_current - in_bytes_previous) / interval_seconds * 8
+
+• Utilization %:
+  utilization_in_pct = (in_bps / interface_speed_mbps / 1,000,000) * 100
+
+• Counter Wrap Detection:
+  32-bit wrap: if current < previous AND (previous - current) > 2^31
+  64-bit wrap: if current < previous AND (previous - current) > 2^63
+
+
+QOS_AGENT Data:
+• Service Availability Score (2-tier model):
+
+  TIER 1 - Connectivity Check (Binary):
+  ┌────────────────────────────────────────┬─────────────────┐
+  │ Condition                              │ Result          │
+  ├────────────────────────────────────────┼─────────────────┤
+  │ No submission in 15-min window         │ OUTAGE (0.0)    │
+  │ Submission but no connectivity         │ OUTAGE (0.0)    │
+  │ No successful tests                    │ OUTAGE (0.0)    │
+  │ At least 1 successful test             │ Continue Tier 2 │
+  └────────────────────────────────────────┴─────────────────┘
+
+  TIER 2 - QoS Quality Score (Weighted):
+  ┌────────────────────────────────────────┬────────┐
+  │ Metric                                 │ Weight │
+  ├────────────────────────────────────────┼────────┤
+  │ Speed Ratio (actual/advertised)        │ 25%    │
+  │ HTTP Reachability                      │ 15%    │
+  │ Packet Loss (inverse)                  │ 20%    │
+  │ DNS Resolution                         │ 10%    │
+  │ Latency (inverse)                      │ 15%    │
+  │ Jitter (inverse)                       │ 5%     │
+  └────────────────────────────────────────┴────────┘
+
+  Score → Status Mapping:
+  ┌─────────────┬────────────────┬─────────────────────┐
+  │ Score Range │ Status         │ Interval Value      │
+  ├─────────────┼────────────────┼─────────────────────┤
+  │ 0           │ OUTAGE         │ 0.00                │
+  │ 1-49%       │ POOR           │ 0.25                │
+  │ 50-79%      │ DEGRADED       │ 0.50                │
+  │ 80-100%     │ AVAILABLE      │ 1.00                │
+  └─────────────┴────────────────┴─────────────────────┘
+
+  Monthly Availability = (Sum of interval values) / (total intervals) × 100
+  Example: 2880 intervals/month, 2736 AVAILABLE = 2736/2880 × 100 = 95%
+
+
+ISP_API Data:
+• Location Mapping:
+  BBS Code (6-digit) → district_id lookup
+  Fallback: text fields → system mapping
+
+• Cross-Validation:
+  Expected subscribers = SUM(BRAS active_sessions)
+  Variance = |Actual - Expected| / Expected × 100
+  Alert if variance > 10%
+
+
+LAYER 2: AGGREGATION TRANSFORMATIONS (TimescaleDB)
+--------------------------------------------------
+
+Raw 15-min data is automatically aggregated:
+
+┌──────────────┬────────────────────────────────────────────────────┐
+│ Time Bucket  │ Aggregation Functions                              │
+├──────────────┼────────────────────────────────────────────────────┤
+│ 15-minute    │ RAW (no aggregation)                               │
+│ 1-hour       │ AVG, MAX, MIN, STDDEV, P95, P99                    │
+│ 1-day        │ AVG, PEAK, weighted availability                   │
+└──────────────┴────────────────────────────────────────────────────┘
+
+Data Retention:
+• Raw data: 1 year
+• Hourly aggregates: 3 years
+• Daily aggregates: 3 years
+• Monthly compliance: 5 years
+
+
+LAYER 3: QUERY TRANSFORMATIONS (API)
+------------------------------------
+
+• Filtering: Time range, ISP, Division, District, Package
+• Grouping: Geographic (division/district), Category (ISP type)
+• Ranking: Division performance, ISP percentile
+• Format: TIMESTAMPTZ → ISO 8601, ENUM → Display labels
+
+
+================================================================================
+6. MOCK DATA STRUCTURE
+================================================================================
+
+SNMP_AGENT MOCK DATA
+--------------------
+{
+  "submission": {
+    "submission_uuid": "550e8400-e29b-41d4-a716-446655440000",
+    "originator_type": "SNMP_AGENT",
+    "agent_uuid": "7c9e6679-7425-40de-944b-e07fc1f90ae7",
+    "isp_id": 142,
+    "submission_time": "2026-01-10T10:15:00+06:00"
+  },
+  "interface_metrics": [
+    {
+      "time": "2026-01-10T10:00:00+06:00",
+      "pop_id": 1523,
+      "interface_type": "INTERNET",
+      "snmp_target": {
+        "target_id": 4521,
+        "device_type": "CORE_GATEWAY",
+        "vendor": "CISCO",
+        "if_speed_mbps": 1000
+      },
+      "metrics": {
+        "admin_status": "UP",
+        "oper_status": "UP",
+        "in_bps": 847523840,
+        "out_bps": 125698560,
+        "utilization_in_pct": 84.75,
+        "utilization_out_pct": 12.57
+      }
+    }
+  ],
+  "subscriber_counts": [
+    {
+      "time": "2026-01-10T10:00:00+06:00",
+      "bras_id": "BRAS-DHK-01",
+      "metrics": {
+        "active_sessions": 48750,
+        "pppoe_sessions": 46892,
+        "dhcp_leases": 1858
+      }
+    }
+  ]
+}
+
+
+QOS_AGENT MOCK DATA
+-------------------
+{
+  "submission": {
+    "submission_uuid": "660e9500-f30c-52e5-b827-557766550111",
+    "originator_type": "QOS_AGENT",
+    "agent_uuid": "8d0f7790-8536-51ef-055c-f18gd2g01bf8",
+    "isp_id": 142,
+    "submission_time": "2026-01-10T10:15:00+06:00"
+  },
+  "speed_test": {
+    "download": {
+      "speed_mbps": 847.25,
+      "bytes_transferred": 3452108800,
+      "duration_ms": 15000
+    },
+    "upload": {
+      "speed_mbps": 423.50,
+      "bytes_transferred": 1726054400,
+      "duration_ms": 15000
+    }
+  },
+  "ping_tests": [
+    {
+      "target": {
+        "type": "NATIONAL",
+        "ip": "103.10.20.1",
+        "name": "BTRC Reference Server"
+      },
+      "latency": {
+        "rtt_avg_ms": 3.2,
+        "rtt_p95_ms": 5.8,
+        "jitter_ms": 1.4
+      },
+      "packet_loss": {
+        "loss_pct": 1.00
+      }
+    }
+  ],
+  "dns_test": {
+    "resolution_ms": 10.35,
+    "status": "SUCCESS"
+  },
+  "http_test": {
+    "reachability_score": 100.0,
+    "status": "SUCCESS"
+  }
+}
+
+
+ISP_API MOCK DATA (4 Types)
+---------------------------
+
+1. PACKAGES:
+{
+  "period": "2026-01",
+  "packages": [
+    {
+      "package_code": "PKG-HOME-100",
+      "package_name": "Home Fiber 100",
+      "download_speed_mbps": 100,
+      "upload_speed_mbps": 50,
+      "price_bdt": 1200.00,
+      "has_fup": true,
+      "fup_threshold_gb": 500,
+      "status": "active"
+    }
+  ]
+}
+
+2. SUBSCRIBERS:
+{
+  "period": "2026-01",
+  "subscribers": [
+    {
+      "package_code": "PKG-HOME-100",
+      "location": {"bbs_code": "302614"},
+      "current_count": 3250,
+      "new_count": 120,
+      "churned_count": 45
+    }
+  ]
+}
+
+3. POPS:
+{
+  "period": "2026-01",
+  "pops": [
+    {
+      "location": {"bbs_code": "302614"},
+      "pop_count": 3,
+      "pop_type": "distribution",
+      "status": "active",
+      "upstream_capacity_mbps": 10000
+    }
+  ]
+}
+
+4. REVENUE:
+{
+  "period": "2026-01",
+  "revenue": [
+    {
+      "package_code": "PKG-HOME-100",
+      "location": {"bbs_code": "302614"},
+      "subscriber_revenue_bdt": 3900000.00,
+      "subscriber_count": 3250
+    }
+  ]
+}
+
+
+MOCK DATA VALUE RANGES
+----------------------
+┌─────────────────────────┬────────────────────────────────┐
+│ Metric                  │ Typical Range                  │
+├─────────────────────────┼────────────────────────────────┤
+│ Download Speed          │ 30-850 Mbps (by ISP tier)      │
+│ Upload Speed            │ 10-400 Mbps                    │
+│ Latency (National)      │ 2-10 ms                        │
+│ Latency (International) │ 50-300 ms                      │
+│ Packet Loss             │ 0-5% (0%=excellent, 5%=poor)   │
+│ Jitter                  │ 0-30 ms                        │
+│ DNS Resolution          │ 5-100 ms                       │
+│ HTTP Availability       │ 80-100%                        │
+│ Interface Utilization   │ 40-95%                         │
+│ Subscriber Count        │ 1,000-500,000 per ISP          │
+└─────────────────────────┴────────────────────────────────┘
+
+
+================================================================================
+7. KEY FILE LOCATIONS (DEV-V2)
+================================================================================
+
+Base Path: /DEV-V2-V/DEV-V2/
+
+ARCHITECTURE & PLANNING:
+• BTRC-FXBB-QOS-POC_Design-Doc(ARCHITECTURE)_DRAFT_v0.1.md
+• 01-planning/BTRC-FXBB-QOS-POC_Dev-Spec(DATA-MODEL-BRIEFING)_FINAL_v1.0.md
+
+DATABASE SCHEMA:
+• 03-data/BTRC-FXBB-QOS-POC_DB-Schema(INDEX)_FINAL_v1.0.md
+• 03-data/BTRC-FXBB-QOS-POC_DB-Schema(STEP-04-TIMESERIES)_FINAL_v1.0.md
+• 03-data/BTRC-FXBB-QOS-POC_Data-Model(INGESTION)_DRAFT_v0.8.md
+
+API SPECIFICATIONS:
+• 04-api/BTRC-FXBB-QOS-POC_Dev-Spec(API-SERVER)_REVIEW-PENDING_v0.9.md
+• 04-api/BTRC-FXBB-QOS-POC_Dev-Spec(SNMP-AGENT)_REVIEW-PENDING_v0.9.md
+• 04-api/BTRC-FXBB-QOS-POC_Dev-Spec(QOS-AGENT)_REVIEW-PENDING_v0.9.md
+
+DASHBOARD UI:
+• 05-ui/BTRC-FXBB-QOS-POC_Design-Doc(DASHBOARD-EXECUTIVE)_FINAL_v1.0.md
+• 05-ui/BTRC-FXBB-QOS-POC_Design-Doc(DASHBOARD-TECH-OPS)_FINAL_v1.0.md
+• 05-ui/BTRC-FXBB-QOS-POC_Design-Doc(DASHBOARD-REGULATORY)_FINAL_v1.0.md
+
+
+================================================================================
+                              QUICK REFERENCE
+================================================================================
+
+DATA FLOW SUMMARY:
+  Source → Agent → API → Validate → Transform → Store → Aggregate → Query → Chart
+
+TRUST HIERARCHY:
+  SNMP (95) > QOS (90) > ISP_API (70)
+
+COLLECTION FREQUENCY:
+  SNMP/QOS: Every 15 min | ISP_API: Monthly
+
+STORAGE:
+  Raw: 1 year | Hourly: 3 years | Daily: 3 years | Monthly: 5 years
+
+DASHBOARDS:
+  Executive (5 tabs) | Tech-Ops (4 tabs) | Regulatory (5 tabs)
+
+KEY TRANSFORMATIONS:
+  • Rate calculation (bps from counters)
+  • Utilization % (bps/capacity)
+  • Service Availability Score (2-tier weighted)
+  • Time-bucket aggregation (15m → 1h → 1d)
+
+================================================================================
+                           END OF DOCUMENT
+================================================================================
