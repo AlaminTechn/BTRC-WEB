@@ -1,0 +1,17 @@
+# BTRC QoS Data Loader Dockerfile
+# Runs Python scripts for data loading without local Python installation
+
+FROM python:3.10-slim
+
+WORKDIR /app
+
+# Install dependencies
+COPY requirements.txt .
+RUN pip install --no-cache-dir -r requirements.txt
+
+# Copy application files
+COPY load_data_docker.py .
+COPY dummy_data_v/ ./dummy_data_v/
+
+# Default command
+CMD ["python", "load_data_docker.py"]

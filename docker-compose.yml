@@ -1,5 +1,20 @@
 version: '3.8'
 
+# BTRC QoS Monitoring System - Docker Compose
+#
+# Prerequisites:
+#   1. Copy .env.example to .env
+#   2. Update values in .env as needed
+#
+# Usage (use 'docker compose' v2 syntax):
+#   Start all services:     docker compose up -d
+#   Start database only:    docker compose up -d btrc-db
+#   Load data:              docker compose run --rm data-loader
+#   Initialize Superset:    docker compose up superset-init
+#   View logs:              docker compose logs -f superset
+#   Stop all:               docker compose down
+#   Remove volumes:         docker compose down -v
+
 services:
   # Main BTRC Database with TimescaleDB
   btrc-db:
@@ -7,19 +22,42 @@ services:
     container_name: btrc-db
     restart: unless-stopped
     ports:
-      - "5434:5432"
+      - "${POSTGRES_EXTERNAL_PORT:-5434}:5432"
     environment:
-      - POSTGRES_USER=btrc
-      - POSTGRES_PASSWORD=btrc_password
-      - POSTGRES_DB=btrc_qos
+      - POSTGRES_USER=${POSTGRES_USER}
+      - POSTGRES_PASSWORD=${POSTGRES_PASSWORD}
+      - POSTGRES_DB=${POSTGRES_DB}
+    env_file:
+      - .env
     volumes:
       - btrc_db_data:/var/lib/postgresql/data
       - ./init-scripts:/docker-entrypoint-initdb.d:ro
     healthcheck:
-      test: ["CMD-SHELL", "pg_isready -U btrc -d btrc_qos"]
+      test: ["CMD-SHELL", "pg_isready -U ${POSTGRES_USER:-btrc} -d ${POSTGRES_DB:-btrc_qos}"]
       interval: 10s
       timeout: 5s
       retries: 5
+
+  # Data Loader - Loads JSON data into database
+  data-loader:
+    build:
+      context: .
+      dockerfile: Dockerfile.dataloader
+    container_name: btrc-data-loader
+    env_file:
+      - .env
+    environment:
+      - POSTGRES_USER=${POSTGRES_USER}
+      - POSTGRES_PASSWORD=${POSTGRES_PASSWORD}
+      - POSTGRES_DB=${POSTGRES_DB}
+      - POSTGRES_HOST=${POSTGRES_HOST:-btrc-db}
+      - POSTGRES_PORT=${POSTGRES_PORT:-5432}
+    volumes:
+      - ./dummy_data_v:/app/dummy_data_v:ro
+    depends_on:
+      btrc-db:
+        condition: service_healthy
+    restart: "no"
 
   # Redis for Superset caching
   redis:
@@ -40,13 +78,15 @@ services:
     container_name: superset-db
     restart: unless-stopped
     environment:
-      - POSTGRES_USER=superset
-      - POSTGRES_PASSWORD=superset
-      - POSTGRES_DB=superset
+      - POSTGRES_USER=${SUPERSET_DB_USER:-superset}
+      - POSTGRES_PASSWORD=${SUPERSET_DB_PASSWORD:-superset}
+      - POSTGRES_DB=${SUPERSET_DB_NAME:-superset}
+    env_file:
+      - .env
     volumes:
       - superset_db_data:/var/lib/postgresql/data
     healthcheck:
-      test: ["CMD-SHELL", "pg_isready -U superset -d superset"]
+      test: ["CMD-SHELL", "pg_isready -U ${SUPERSET_DB_USER:-superset} -d ${SUPERSET_DB_NAME:-superset}"]
       interval: 10s
       timeout: 5s
       retries: 5
@@ -59,11 +99,13 @@ services:
     ports:
       - "8088:8088"
     environment:
-      - SUPERSET_SECRET_KEY=btrc-qos-monitoring-secret-key-2026
-      - DATABASE_URL=postgresql://superset:superset@superset-db:5432/superset
-      - REDIS_URL=redis://redis:6379/0
+      - SUPERSET_SECRET_KEY=${SUPERSET_SECRET_KEY}
+      - DATABASE_URL=postgresql://${SUPERSET_DB_USER:-superset}:${SUPERSET_DB_PASSWORD:-superset}@superset-db:5432/${SUPERSET_DB_NAME:-superset}
+      - REDIS_URL=${REDIS_URL:-redis://redis:6379/0}
       - FLASK_APP=superset
       - SUPERSET_LOAD_EXAMPLES=no
+    env_file:
+      - .env
     volumes:
       - superset_home:/app/superset_home
       - ./superset_config.py:/app/pythonpath/superset_config.py:ro
@@ -86,9 +128,11 @@ services:
     image: apache/superset:3.1.0
     container_name: superset-init
     environment:
-      - SUPERSET_SECRET_KEY=btrc-qos-monitoring-secret-key-2026
-      - DATABASE_URL=postgresql://superset:superset@superset-db:5432/superset
-      - REDIS_URL=redis://redis:6379/0
+      - SUPERSET_SECRET_KEY=${SUPERSET_SECRET_KEY}
+      - DATABASE_URL=postgresql://${SUPERSET_DB_USER:-superset}:${SUPERSET_DB_PASSWORD:-superset}@superset-db:5432/${SUPERSET_DB_NAME:-superset}
+      - REDIS_URL=${REDIS_URL:-redis://redis:6379/0}
+    env_file:
+      - .env
     volumes:
       - superset_home:/app/superset_home
       - ./superset_config.py:/app/pythonpath/superset_config.py:ro
@@ -102,11 +146,11 @@ services:
         echo 'Initializing Superset...' &&
         superset db upgrade &&
         superset fab create-admin \
-          --username admin \
+          --username ${SUPERSET_ADMIN_USERNAME:-admin} \
           --firstname Admin \
           --lastname User \
-          --email admin@btrc.gov.bd \
-          --password admin123 || true &&
+          --email ${SUPERSET_ADMIN_EMAIL:-admin@btrc.gov.bd} \
+          --password ${SUPERSET_ADMIN_PASSWORD:-admin123} || true &&
         superset init &&
         echo 'Superset initialization complete!'
       "

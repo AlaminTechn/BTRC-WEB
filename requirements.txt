@@ -1,0 +1,4 @@
+# BTRC QoS Monitoring - Python Dependencies
+# Used by Docker data-loader service
+
+psycopg2-binary==2.9.9
